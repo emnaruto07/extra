@@ -20,6 +20,7 @@ Usage:
   Phase 2:  python3 adenum.py --dc-ip 10.0.0.10 --domain corp.local -u jdoe -p 'Pass1!'
 """
 import argparse
+import json
 import socket
 import sys
 from datetime import datetime, timedelta, timezone
@@ -353,15 +354,42 @@ def smb_null_session(dc_ip, domain):
     return users
 
 
-def network_sweep(cidr_or_ip, domain):
+def _cache_path(target):
+    """Deterministic cache file for a scan target (CIDR or IP)."""
+    safe = target.replace('/', '_').replace('.', '-')
+    cache_dir = os.path.join(os.path.expanduser('~'), '.adenum_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, safe + '.json')
+
+
+def network_sweep(cidr_or_ip, domain, refresh=False):
     """
     Network-level recon. TCP port sweep of the subnet + per-host service recon:
       - SMB: signing status (relay targets), OS, hostname, domain, SMBv1
       - HTTP: server headers, auth walls
+    Results cached in ~/.adenum_cache/<target>.json - reruns load instantly
+    instead of rescanning. Use refresh=True (or --refresh) to force a rescan.
     No authentication performed anywhere - pure pre-auth recon.
     """
     import concurrent.futures
     from ipaddress import ip_network, ip_address
+
+    # ---- cache check
+    cpath = _cache_path(cidr_or_ip)
+    if not refresh and os.path.isfile(cpath):
+        try:
+            with open(cpath) as f:
+                cached = json.load(f)
+            good('[cache] Loaded %s (%s hosts, scanned %s) - use --refresh to rescan'
+                 % (cidr_or_ip, cached.get('alive_count', '?'),
+                    cached.get('timestamp', '?')))
+            return {'alive': cached['alive'], 'signing_off': cached['signing_off'],
+                    'smbv1': cached['smbv1'], 'hosts': cached['hosts'],
+                    'cached': True}
+        except (json.JSONDecodeError, KeyError) as e:
+            warn('[cache] corrupt (%s) - rescanning' % e)
+    elif refresh:
+        info('[cache] --refresh: rescanning %s' % cidr_or_ip)
 
     p_info('Network sweep: %s' % cidr_or_ip)
     try:
@@ -459,16 +487,52 @@ def network_sweep(cidr_or_ip, domain):
     # -------- HTTP/web-app recon: titles, fingerprints, known internal apps
     web_recon(alive, hostinfo)
 
+    # ---- write cache
+    try:
+        with open(cpath, 'w') as f:
+            json.dump({'timestamp': datetime.now(timezone.utc).isoformat(),
+                       'target': cidr_or_ip,
+                       'alive_count': len(alive),
+                       'alive': alive,
+                       'signing_off': signing_off,
+                       'smbv1': smbv1_hosts,
+                       'hosts': hostinfo}, f, indent=1)
+        good('[cache] Saved %s -> %s' % (cidr_or_ip, cpath))
+    except OSError as e:
+        warn('[cache] write failed: %s' % e)
+
     return {'alive': alive, 'signing_off': signing_off, 'smbv1': smbv1_hosts, 'hosts': hostinfo}
 
 
-def web_recon(alive, hostinfo, shot_dir=None):
+def web_recon(alive, hostinfo, shot_dir=None, cached=False):
     """Web-app fingerprinting for all discovered web ports. Optionally screenshots
-    each page to shot_dir/<ip>_<port>.png via headless Chromium (playwright)."""
+    each page to shot_dir/<ip>_<port>.png via headless Chromium (playwright).
+    cached=True: skip network fingerprinting, only capture missing screenshots."""
     WEB_PORTS = (80, 443, 3000, 4443, 5000, 7001, 8000, 8080, 8081, 8443, 8888,
                  9000, 9090, 15672)
     browser = None
     ctx = None
+    web_targets = []
+    for ip in alive:
+        for port in hostinfo[ip]['ports'] if hostinfo else []:
+            if port not in WEB_PORTS:
+                continue
+            web_targets.append((ip, port))
+    if cached:
+        # from a cache run: only fetch screenshots that don't exist on disk yet
+        if not shot_dir or not web_targets:
+            info('[cache] web results from cache - no screenshots requested')
+            return web_targets
+        missing = [(ip, port) for ip, port in web_targets
+                   if not os.path.isfile(os.path.join(shot_dir, '%s_%d.png' % (ip, port)))]
+        if not missing:
+            good('[cache] all %d screenshots already on disk - nothing to do'
+                 % len(web_targets))
+            return web_targets
+        info('[cache] %d/%d screenshots missing - capturing only those'
+             % (len(missing), len(web_targets)))
+        web_targets = missing
+        # fall through to screenshot-only path (browser started below)
     if shot_dir:
         try:
             from playwright.sync_api import sync_playwright
@@ -488,12 +552,28 @@ def web_recon(alive, hostinfo, shot_dir=None):
             warn('Screenshots unavailable (%s) - continuing without' %
                  str(e).split(chr(10))[0][:60])
             browser = None
-    web_targets = []
-    for ip in alive:
-        for port in hostinfo[ip]['ports'] if hostinfo else []:
-            if port not in WEB_PORTS:
-                continue
-            web_targets.append((ip, port))
+    if cached:
+        # screenshot-only pass for missing shots (no network GET fingerprinting)
+        for ip, port in web_targets:
+            if browser:
+                try:
+                    page = ctx.new_page()
+                    page.goto('http://%s:%d' % (ip, port), timeout=8000,
+                              wait_until='domcontentloaded')
+                    page.wait_for_timeout(700)
+                    fname = os.path.join(shot_dir, '%s_%d.png' % (ip, port))
+                    page.screenshot(path=fname)
+                    page.close()
+                    good('    screenshot: %s' % fname)
+                except Exception as e:
+                    p_info('    screenshot failed: %s' % str(e).split(chr(10))[0][:50])
+        if browser:
+            try:
+                browser.close()
+                _pw.stop()
+            except Exception:
+                pass
+        return web_targets
     for ip, port in web_targets:
             try:
                 s = socket.create_connection((ip, port), timeout=3)
@@ -1101,6 +1181,8 @@ def main():
     ap.add_argument('--web', action='store_true',
                     help='standalone web-app mode: fingerprint + screenshot web ports only '
                          '(skips AD/LDAP/Kerberos checks)')
+    ap.add_argument('--refresh', action='store_true',
+                    help='force rescan: ignore and overwrite the result cache')
     ap.add_argument('--shots', default='screenshots',
                     help='screenshot output dir for web mode (default ./screenshots)')
     ap.add_argument('-o', '--out', help='save findings + user list to this prefix')
@@ -1114,8 +1196,9 @@ def main():
     # ---------------- WEB MODE: sweep + fingerprint + screenshot, nothing else
     if args.web:
         targets = args.cidr or (args.dc_ip + '/32')
-        sweep = network_sweep(targets, args.domain)
-        web_recon(sweep['alive'], sweep['hosts'], shot_dir=args.shots)
+        sweep = network_sweep(targets, args.domain, refresh=args.refresh)
+        web_recon(sweep['alive'], sweep['hosts'], shot_dir=args.shots,
+                  cached=sweep.get('cached', False))
         print()
         print('=' * 60)
         high = [(c, m) for c, m in FINDINGS if c in HIGH_WIN_CATS]
@@ -1148,7 +1231,7 @@ def main():
 
     sweep = None
     if args.cidr:
-        sweep = network_sweep(args.cidr, args.domain)
+        sweep = network_sweep(args.cidr, args.domain, refresh=args.refresh)
 
     # DNS recon - no auth needed
     dns_recon(args.dc_ip, args.domain)
