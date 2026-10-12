@@ -468,11 +468,20 @@ def web_recon(alive, hostinfo, shot_dir=None):
     WEB_PORTS = (80, 443, 3000, 4443, 5000, 7001, 8000, 8080, 8081, 8443, 8888,
                  9000, 9090, 15672)
     browser = None
+    ctx = None
     if shot_dir:
         try:
             from playwright.sync_api import sync_playwright
             _pw = sync_playwright().start()
-            browser = _pw.chromium.launch(headless=True)
+            browser = _pw.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled'])
+            # real-browser UA: default HeadlessChrome UA is a log red flag
+            ctx = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                ignore_https_errors=True,
+                viewport={'width': 1280, 'height': 800})
             os.makedirs(shot_dir, exist_ok=True)
             good('Screenshot dir: %s' % shot_dir)
         except Exception as e:
@@ -570,8 +579,7 @@ def web_recon(alive, hostinfo, shot_dir=None):
                 # screenshot
                 if browser:
                     try:
-                        page = browser.new_page(viewport={'width': 1280, 'height': 800},
-                                                ignore_https_errors=True)
+                        page = ctx.new_page()
                         page.goto('http://%s:%d' % (ip, port), timeout=8000,
                                   wait_until='domcontentloaded')
                         page.wait_for_timeout(700)
