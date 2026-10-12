@@ -38,14 +38,31 @@ except ImportError:
 
 FINDINGS = []
 
+# ANSI colors (auto-disabled when stdout is piped or NO_COLOR set)
+import os as _os
+if _os.environ.get('NO_COLOR') or not sys.stdout.isatty():
+    _RED, _YEL, _GRN, _CYN, _BOLD, _RST = ('',) * 6
+else:
+    _RED, _YEL, _GRN, _CYN, _BOLD, _RST = ('\033[91m', '\033[93m', '\033[92m',
+                                            '\033[96m', '\033[1m', '\033[0m')
+
 def info(msg):  print('[*] ' + msg)
 def good(msg):  print('[+] ' + msg)
 def warn(msg):  print('[!] ' + msg)
 def bad(msg):   print('[-] ' + msg)
 
+# categories that are near-guaranteed wins -> red output
+HIGH_WIN_CATS = {'zerologon', 'laps', 'gpp', 'asrep', 'spray', 'anon-ldap',
+                 'null-smb', 'dns-axfr', 'snmp', 'petitpotam', 'spooler'}
+
 def finding(cat, msg):
     FINDINGS.append((cat, msg))
-    print('  [>>] %-14s %s' % ('[' + cat.upper() + ']', msg))
+    label = '[' + cat.upper() + ']'
+    if cat in HIGH_WIN_CATS:
+        # red+bold: near-guaranteed win (creds/DA path)
+        print('  [>>] ' + _RED + _BOLD + ('%-14s %s' % (label, msg)) + _RST)
+    else:
+        print('  [>>] %-14s %s' % (label, msg))
 
 # ------------------------------------------------------------------ utils
 
@@ -358,7 +375,9 @@ def network_sweep(cidr_or_ip, domain):
 
     # ---- TCP sweep: top AD/internal ports
     PORTS = [53, 88, 135, 139, 161, 389, 445, 464, 514, 636, 1433, 1521, 3268, 3269,
-             3389, 5432, 5985, 5986, 6379, 8080, 8443, 9250, 47001, 4243]
+             3389, 5432, 5985, 5986, 6379, 8080, 8443, 9250, 47001, 4243,
+             80, 443, 3000, 5000, 7001, 8000, 8888, 9000, 9090, 15672,
+             4443, 8081]
     WEB = {80: 'HTTP', 443: 'HTTPS', 8080: 'HTTP-alt', 8443: 'HTTPS-alt'}
 
     def scan_host(ip):
@@ -435,27 +454,94 @@ def network_sweep(cidr_or_ip, domain):
         except Exception as e:
             p_info('%-16s SMB2 negotiation failed: %s' % (ip, str(e).split(chr(10))[0][:50]))
 
-    # -------- HTTP recon: IIS/Exchange endpoints, titles
+    # -------- HTTP/web-app recon: titles, fingerprints, known internal apps
+    WEB_PORTS = (80, 443, 3000, 4443, 5000, 7001, 8000, 8080, 8081, 8443, 8888,
+                 9000, 9090, 15672)
     for ip in alive:
-        for port in (80, 443, 8080):
-            if port not in hostinfo[ip]['ports']:
+        for port in hostinfo[ip]['ports']:
+            if port not in WEB_PORTS:
                 continue
             try:
-                s = socket.create_connection((ip, port), timeout=2)
-                s.sendall(b'HEAD / HTTP/1.0\r\nHost: %s\r\n\r\n' % ip.encode())
-                resp = s.recv(1024).decode('utf-8', 'replace')
+                s = socket.create_connection((ip, port), timeout=3)
+                s.sendall(b'GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n'
+                          b'Accept: */*\r\nConnection: close\r\n\r\n' % ip.encode())
+                chunks = b''
+                try:
+                    while len(chunks) < 8192:
+                        c = s.recv(4096)
+                        if not c:
+                            break
+                        chunks += c
+                except OSError:
+                    pass
                 s.close()
+                resp = chunks.decode('utf-8', 'replace')
+                if not resp:
+                    continue
+                head, _, body = resp.partition('\r\n\r\n')
+                status = head.split(' ')[1] if len(head.split(' ')) > 1 else '?'
                 server = ''
-                for line in resp.splitlines():
+                for line in head.splitlines():
                     if line.lower().startswith('server:'):
                         server = line.split(':', 1)[1].strip()
-                status = resp.split(' ')[1] if len(resp.split(' ')) > 1 else ''
-                if server:
-                    p_info('%-16s:%-4d HTTP %s %s' % (ip, port, status, server))
-                if server and ('exchange' in server.lower() or 'owa' in server.lower()):
-                    finding('http', 'Exchange/OWA on %s:%d (%s) -> potential relay/OAuth surface' % (ip, port, server))
-                elif server and 'iis' in server.lower():
-                    finding('http', 'IIS on %s:%d - check /owa /ecp /autodiscover' % (ip, port))
+                    if line.lower().startswith('location:'):
+                        loc = line.split(':', 1)[1].strip()
+                        p_info('%-16s:%-4d redirect %s -> %s' % (ip, port, status, loc))
+                # title
+                import re as _re
+                tmatch = _re.search(r'<title[^>]*>(.*?)</title>', body, _re.I | _re.S)
+                title = tmatch.group(1).strip()[:70] if tmatch else ''
+                locl = body.lower()
+                base = '%s:%d' % (ip, port)
+                p_info('%-16s:%-4d HTTP %s %-25s %s' % (ip, port, status, server, title))
+                # fingerprint known internal apps
+                apps = [
+                    ('tomcat',        'manager/html' in locl or 'tomcat' in (server + title).lower(),
+                     'Tomcat - try /manager/html default creds'),
+                    ('jenkins',       'jenkins' in (server + title).lower() or '/jenkins' in locl,
+                     'Jenkins - check unauth /script, CVE-2024-23897 (CLI)'),
+                    ('gitlab',        'gitlab' in (server + title).lower(),
+                     'GitLab - check signup enabled, public repos'),
+                    ('grafana',       'grafana' in (server + title).lower(),
+                     'Grafana - default admin/admin, anon dashboards'),
+                    ('kibana',        'kibana' in (server + title).lower() or '"kbn"' in locl,
+                     'Kibana - data exposure via .kibana'),
+                    ('elasticsearch', 'you know, for search' in locl or 'elasticsearch' in server.lower(),
+                     'Elasticsearch - usually unauth API, full data read'),
+                    ('jira/confluence', 'confluence' in locl or 'jira' in locl or 'confluence' in (server + title).lower(),
+                     'Confluence - CVE-2023-22515 (setup wizard), CVE-2024-21683 RCE'),
+                    ('nexus',         'nexus repository' in locl,
+                     'Nexus Repo - anon browse, CVE-2024-4956 path traversal'),
+                    ('jenkins-cli',   'x-jenkins' in locl or 'x-jenkins' in head.lower(),
+                     'Jenkins version header - check CVEs'),
+                    ('phpmyadmin',    'phpmyadmin' in locl,
+                     'phpMyAdmin - brute surface'),
+                    ('wordpress',     'wp-content' in locl or 'wp-login' in locl,
+                     'WordPress - wpscan, plugin vulns'),
+                    ('git-exposed',   'ref: refs/' in locl or '.git/config' in locl,
+                     'Git repo exposure?'),
+                ]
+                for name, hit, note in apps:
+                    if hit:
+                        finding('webapp', '%s on %s - %s' % (name, base, note))
+                # generic but valuable: auth wall = spray target
+                if status == '401':
+                    finding('webapp', 'HTTP 401 on %s - auth surface (basic/NTLM? spray/relay target)' % base)
+                # IIS generic
+                if server and 'iis' in server.lower() \
+                        and 'exchange' not in (server + title).lower() \
+                        and 'outlook' not in (server + title).lower():
+                    finding('webapp', 'IIS on %s - check /owa /ecp /autodiscover /aspnet_client' % base)
+                # directory listing exposed
+                if 'index of /' in title.lower() or 'directory listing' in locl \
+                        or 'index of' in title.lower():
+                    finding('webapp', 'Directory listing exposed on %s (%s)' % (base, title))
+                # IIS/Exchange (title or server markers)
+                if server or title:
+                    st = (server + ' ' + title).lower()
+                    if 'exchange' in st or 'owa' in st or 'outlook' in st:
+                        finding('webapp', 'Exchange/OWA on %s (%s %s) -> relay target + spray surface'
+                                % (base, server, title))
             except OSError:
                 pass
 
@@ -1042,10 +1128,18 @@ def main():
 
     print()
     print('=' * 60)
-    print(' FINDINGS SUMMARY (%d)' % len(FINDINGS))
+    high = [(c, m) for c, m in FINDINGS if c in HIGH_WIN_CATS]
+    rest = [(c, m) for c, m in FINDINGS if c not in HIGH_WIN_CATS]
+    print(' FINDINGS SUMMARY (%d total, %d HIGH-WIN)' % (len(FINDINGS), len(high)))
     print('=' * 60)
-    for cat, msg in FINDINGS:
-        print('  [%s] %s' % (cat, msg))
+    if high:
+        print(_RED + _BOLD + ' >>> HIGH-WIN (creds/DA path):' + _RST)
+        for cat, msg in high:
+            print('  ' + _RED + ('[%s] %s' % (cat, msg)) + _RST)
+    if rest:
+        print(' Other findings:')
+        for cat, msg in rest:
+            print('  [%s] %s' % (cat, msg))
     if not FINDINGS:
         print('  (no findings - harden up or get creds)')
     print()
