@@ -454,13 +454,38 @@ def network_sweep(cidr_or_ip, domain):
         except Exception as e:
             p_info('%-16s SMB2 negotiation failed: %s' % (ip, str(e).split(chr(10))[0][:50]))
 
+    check_snmp_hosts(alive, hostinfo)
+
     # -------- HTTP/web-app recon: titles, fingerprints, known internal apps
+    web_recon(alive, hostinfo)
+
+    return {'alive': alive, 'signing_off': signing_off, 'smbv1': smbv1_hosts, 'hosts': hostinfo}
+
+
+def web_recon(alive, hostinfo, shot_dir=None):
+    """Web-app fingerprinting for all discovered web ports. Optionally screenshots
+    each page to shot_dir/<ip>_<port>.png via headless Chromium (playwright)."""
     WEB_PORTS = (80, 443, 3000, 4443, 5000, 7001, 8000, 8080, 8081, 8443, 8888,
                  9000, 9090, 15672)
+    browser = None
+    if shot_dir:
+        try:
+            from playwright.sync_api import sync_playwright
+            _pw = sync_playwright().start()
+            browser = _pw.chromium.launch(headless=True)
+            os.makedirs(shot_dir, exist_ok=True)
+            good('Screenshot dir: %s' % shot_dir)
+        except Exception as e:
+            warn('Screenshots unavailable (%s) - continuing without' %
+                 str(e).split(chr(10))[0][:60])
+            browser = None
+    web_targets = []
     for ip in alive:
-        for port in hostinfo[ip]['ports']:
+        for port in hostinfo[ip]['ports'] if hostinfo else []:
             if port not in WEB_PORTS:
                 continue
+            web_targets.append((ip, port))
+    for ip, port in web_targets:
             try:
                 s = socket.create_connection((ip, port), timeout=3)
                 s.sendall(b'GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n'
@@ -542,15 +567,38 @@ def network_sweep(cidr_or_ip, domain):
                     if 'exchange' in st or 'owa' in st or 'outlook' in st:
                         finding('webapp', 'Exchange/OWA on %s (%s %s) -> relay target + spray surface'
                                 % (base, server, title))
+                # screenshot
+                if browser:
+                    try:
+                        page = browser.new_page(viewport={'width': 1280, 'height': 800},
+                                                ignore_https_errors=True)
+                        page.goto('http://%s:%d' % (ip, port), timeout=8000,
+                                  wait_until='domcontentloaded')
+                        page.wait_for_timeout(700)
+                        fname = os.path.join(shot_dir, '%s_%d.png' % (ip, port))
+                        page.screenshot(path=fname)
+                        page.close()
+                        good('    screenshot: %s' % fname)
+                    except Exception as e:
+                        p_info('    screenshot failed: %s' % str(e).split(chr(10))[0][:50])
             except OSError:
                 pass
+    if browser:
+        try:
+            browser.close()
+            _pw.stop()
+        except Exception:
+            pass
+    return web_targets
 
-    # -------- SNMP easy win: community 'public'
+
+def check_snmp_hosts(alive, hostinfo):
+    """SNMP easy win: community 'public' on discovered hosts."""
     for ip in alive:
         if 161 not in hostinfo[ip]['ports']:
             continue
         try:
-            from pysnmp.hlapi import (CommunityData, UdpTransportTarget, getCmd,
+            from pysnmp.hlapi import (SnmpEngine, CommunityData, UdpTransportTarget, getCmd,
                                       ObjectType, ObjectIdentity, ContextData)
             iterator = getCmd(SnmpEngine(), CommunityData('public', mpModel=0),
                               UdpTransportTarget((ip, 161), timeout=2),
@@ -561,8 +609,6 @@ def network_sweep(cidr_or_ip, domain):
             break
         except Exception:
             pass
-
-    return {'alive': alive, 'signing_off': signing_off, 'smbv1': smbv1_hosts, 'hosts': hostinfo}
 
 
 def kerb_user_oracle(dc_ip, domain, users):
@@ -1044,12 +1090,39 @@ def main():
     ap.add_argument('-u', '--username')
     ap.add_argument('-p', '--password')
     ap.add_argument('--users', help='username wordlist for AS-REP roasting (phase 1)')
+    ap.add_argument('--web', action='store_true',
+                    help='standalone web-app mode: fingerprint + screenshot web ports only '
+                         '(skips AD/LDAP/Kerberos checks)')
+    ap.add_argument('--shots', default='screenshots',
+                    help='screenshot output dir for web mode (default ./screenshots)')
     ap.add_argument('-o', '--out', help='save findings + user list to this prefix')
     args = ap.parse_args()
 
     print('=' * 60)
-    print(' adenum | %s | %s' % (args.domain, args.dc_ip))
+    print(' adenum | %s | %s%s' % (args.domain, args.dc_ip,
+                                  ' | WEB MODE' if args.web else ''))
     print('=' * 60)
+
+    # ---------------- WEB MODE: sweep + fingerprint + screenshot, nothing else
+    if args.web:
+        targets = args.cidr or (args.dc_ip + '/32')
+        sweep = network_sweep(targets, args.domain)
+        web_recon(sweep['alive'], sweep['hosts'], shot_dir=args.shots)
+        print()
+        print('=' * 60)
+        high = [(c, m) for c, m in FINDINGS if c in HIGH_WIN_CATS]
+        rest = [(c, m) for c, m in FINDINGS if c not in HIGH_WIN_CATS]
+        print(' WEB MODE FINDINGS (%d total, %d HIGH-WIN)' % (len(FINDINGS), len(high)))
+        print('=' * 60)
+        if high:
+            print(_RED + _BOLD + ' >>> HIGH-WIN (creds/DA path):' + _RST)
+            for cat, msg in high:
+                print('  ' + _RED + ('[%s] %s' % (cat, msg)) + _RST)
+        for cat, msg in rest:
+            print('  [%s] %s' % (cat, msg))
+        if not FINDINGS:
+            print('  (no findings)')
+        return
 
     check_ports(args.dc_ip)
 
