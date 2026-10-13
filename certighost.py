@@ -1041,6 +1041,33 @@ def port_ok(h, p, t=1.0):
         _debug_exception(f"Rogue server readiness check {h}:{p}", exc)
         return False
 
+
+def check_prerequisites():
+    """Fail fast with an actionable fix instead of dying mid-exploit.
+
+    Kali's apt-shipped impacket (0.11/0.12) imports cleanly but has no
+    LDAPConnection.add(), which would only surface deep inside the LDAPS
+    computer-creation path (as a swallowed AttributeError, followed by a
+    misleading SAMR 'rpc_s_access_denied'). Catch it up front instead."""
+    try:
+        from importlib.metadata import version as _pkg_version
+        ver = _pkg_version("impacket")
+    except Exception:
+        ver = "unknown"
+    if not hasattr(impacket_ldap.LDAPConnection, "add"):
+        print(f"[!] impacket {ver}: LDAPConnection.add() missing (needs impacket >= 0.13.0)")
+        print("    The LDAPS computer-creation path requires it. Fix with ONE of:")
+        print("      Kali/Debian system Python : sudo python3 -m pip install --upgrade 'impacket>=0.13.0' --break-system-packages")
+        print("      Virtualenv / venv         : pip install --upgrade 'impacket>=0.13.0'")
+        sys.exit(1)
+    print(f"[*] Prerequisites OK: impacket {ver}")
+    try:
+        import dns.resolver
+    except ImportError:
+        print("[!] dnspython missing: CA hostname resolution disabled — pass --ca-ip explicitly")
+    return ver
+
+
 def main():
     global DEBUG
     p = argparse.ArgumentParser(description="CertiGhost - cdc-redirect chain PoC",
@@ -1069,6 +1096,8 @@ def main():
                    help="Show protocol stages, decoded errors and full tracebacks")
     args = p.parse_args()
     DEBUG = args.debug
+
+    check_prerequisites()
 
     if os.geteuid() != 0:
         print("[!] Must run as root (ports 445+389)"); sys.exit(1)
